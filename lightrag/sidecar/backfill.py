@@ -29,8 +29,11 @@ A chunk that reaches this stage without a usable ``_source_span`` is a hard erro
 the document is marked FAILED via :class:`ChunkBlockMatchError`. The sole exception
 is a chunk whose decoded content carries the Unicode replacement character
 (:data:`_REPLACEMENT_CHAR`) — a multi-byte UTF-8 char split at a token-window
-boundary corrupts both its span probe and its own content, making provenance
-impossible; such a chunk degrades to no-sidecar rather than failing the document.
+boundary also corrupts its own content. The span is still recovered — the
+replacement characters are trimmed before the locate probe and the span is widened
+back over the split character, so :func:`_replacement_edge_match` accepts the
+result. Only a window that is *nothing but* replacement characters stays
+unlocatable, and it degrades to no-sidecar rather than failing the document.
 
 Multimodal placeholder tags (``<table …>…</table>``, ``<drawing …/>``,
 ``<equation …>…</equation>``) appear verbatim in both block content and chunk
@@ -44,6 +47,10 @@ from pathlib import Path
 from typing import Any
 
 from lightrag.chunk_schema import normalize_chunk_sidecar
+from lightrag.chunker.token_size import (
+    _REPLACEMENT_CHAR,
+    _replacement_edge_match,
+)
 from lightrag.exceptions import ChunkBlockMatchError
 from lightrag.utils import logger
 
@@ -51,23 +58,28 @@ from lightrag.utils import logger
 # lightrag/sidecar/writer.py and lightrag/utils_pipeline.py.
 _BLOCK_SEPARATOR = "\n\n"
 
-# U+FFFD. The fixed-token chunker decodes arbitrary token windows; when a window
-# boundary splits a multi-byte UTF-8 character (4-byte supplementary-plane chars:
-# emoji, rare CJK extensions), the partial decode yields this replacement character
-# in *both* the span probe and the chunk's own content. Such a chunk is then
-# inherently unlocatable in the source — by span or by text — so provenance is
-# impossible for it. We degrade to no-sidecar for that single chunk rather than
-# failing the whole document.
-_REPLACEMENT_CHAR = "�"
+# U+FFFD, imported from the chunker along with the predicate so the two halves
+# of one rule cannot drift apart. The chunker decodes arbitrary token windows;
+# when a window boundary splits a multi-byte UTF-8 character (4-byte
+# supplementary-plane chars like emoji and rare CJK extensions, and 3-byte BMP
+# ones too), the partial decode yields the replacement character and the window
+# no longer occurs verbatim in the source. Trimming those characters before the
+# probe and widening the span back over the split character recovers it, so most
+# such windows do keep provenance; what remains is a window made *entirely* of
+# replacement characters, which is still unlocatable and degrades to no-sidecar
+# rather than failing the whole document.
 
 
 def _is_unlocatable(body: str) -> bool:
-    """True when a chunk's content cannot be located in the source by any means.
+    """True when a chunk's content still cannot be located in the source.
 
     See :data:`_REPLACEMENT_CHAR`: a chunk whose decoded content carries U+FFFD lost
-    bytes at a multi-byte token boundary, so neither its span nor its text can be
-    matched against the verbatim ``blocks.jsonl`` content. Callers skip provenance for
-    such chunks instead of marking the document FAILED.
+    bytes at a multi-byte token boundary. Most such chunks recover a span -- the
+    replacement characters are trimmed before the locate probe and the span is
+    widened back over them, which :func:`_replacement_edge_match` then accepts -- so
+    this is now only the last-resort branch, for a window made entirely of
+    replacement characters. Callers skip provenance for those instead of marking the
+    document FAILED.
     """
     return _REPLACEMENT_CHAR in body
 
@@ -177,7 +189,11 @@ def _chunk_source_span(
     if not isinstance(body, str):
         return None
     source_text = merged[start:end]
-    if source_text != body and _normalize_text(source_text) != _normalize_text(body):
+    if (
+        source_text != body
+        and _normalize_text(source_text) != _normalize_text(body)
+        and not _replacement_edge_match(source_text, body)
+    ):
         return None
     return start, end
 
@@ -196,10 +212,10 @@ def backfill_chunk_sidecars(
     document FAILED.
 
     Exception: a chunk whose content carries the Unicode replacement character
-    (:data:`_REPLACEMENT_CHAR`) is inherently unlocatable — a multi-byte UTF-8
-    character was split at a token-window boundary, corrupting both its span probe
-    and its own content. Such a chunk is skipped (no sidecar) instead of failing the
-    document.
+    (:data:`_REPLACEMENT_CHAR`) is a last resort — a multi-byte UTF-8 character
+    split at a token-window boundary corrupts the chunk's own content, and only a
+    window made entirely of replacement characters is still unlocatable. Such a
+    chunk is skipped (no sidecar) instead of failing the document.
     """
     if not blocks_path:
         return

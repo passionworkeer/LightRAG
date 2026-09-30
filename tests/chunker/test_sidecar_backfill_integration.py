@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from lightrag.chunker import chunking_by_fixed_token
+from lightrag.chunker.token_size import chunking_by_token_size
 from lightrag.sidecar import backfill_chunk_sidecars
 from lightrag.utils import (
     Tokenizer,
@@ -286,13 +287,21 @@ def test_real_tiktoken_token_windows_match_verbatim(tmp_path: Path) -> None:
 
 
 @pytest.mark.offline
-def test_real_tiktoken_multibyte_boundary_degrades_not_fails(tmp_path: Path) -> None:
-    # Regression: tiktoken is byte-level, so a 4-byte UTF-8 char (emoji / rare CJK
-    # extension) can have its bytes split across a token-window boundary. Decoding the
-    # partial window yields U+FFFD in BOTH the chunk content and its span probe, so the
-    # chunk is unlocatable by span or by text. Span-first backfill must skip provenance
-    # for the corrupt chunks while still attributing the clean ones, not FAIL the whole
-    # document.
+def test_real_tiktoken_multibyte_boundary_keeps_provenance_not_fails(
+    tmp_path: Path,
+) -> None:
+    # tiktoken is byte-level, so a 4-byte UTF-8 char (emoji / rare CJK
+    # extension) can have its bytes split across a token-window boundary and the
+    # partial window decodes with U+FFFD. Such a window used to be unlocatable
+    # by span *and* by text, so backfill dropped provenance for it; because the
+    # condition repeats across consecutive windows, a whole run of chunks lost
+    # theirs and the surviving spans did not reach across the gap.
+    #
+    # The contract now: a window that still carries replacement characters keeps
+    # its provenance (the span is recovered by trimming them and widening back
+    # over the split character). A window that is *nothing but* replacement
+    # characters is still unlocatable, and degrades to no-sidecar -- the
+    # document must never be failed because of it.
     pytest.importorskip("tiktoken")
     from lightrag.utils import TiktokenTokenizer
 
@@ -308,20 +317,31 @@ def test_real_tiktoken_multibyte_boundary_degrades_not_fails(tmp_path: Path) -> 
         chunk_overlap_token_size=4,
         _emit_source_span=True,
     )
-    # The window splits at least one emoji -> some chunks carry U+FFFD and lack a span.
+    # The window splits at least one emoji, so the premise holds.
     assert any("�" in c["content"] for c in chunks)
-    assert any("_source_span" not in c for c in chunks)
 
-    # Must NOT raise: corrupt chunks are skipped, the rest are attributed.
+    # Must NOT raise: an unlocatable chunk degrades, the document is processed.
     backfill_chunk_sidecars(chunks, blocks_path)
 
+    # Whatever kept a span is attributed to the single source block, including
+    # the chunks whose content carries replacement characters.
+    attributed = 0
     for ch in chunks:
-        if "�" in ch["content"]:
-            assert "sidecar" not in ch  # provenance degraded, document not failed
-        elif ch["content"].strip():  # empty tail chunks are skipped entirely
-            assert ch["sidecar"]["refs"] == [{"type": "block", "id": "b1"}]
-    # At least the clean chunks resolved into the single source block.
-    assert any("sidecar" in ch for ch in chunks)
+        if not ch["content"].strip():
+            continue  # empty tail chunks are skipped entirely
+        if "sidecar" not in ch:
+            # Only a genuinely unlocatable chunk may be left without one, and
+            # it must be one the server could not have located either.
+            assert "�" in ch["content"], (
+                f"chunk {ch['chunk_order_index']} lost provenance without a "
+                f"replacement character to explain it"
+            )
+            continue
+        assert ch["sidecar"]["refs"] == [{"type": "block", "id": "b1"}]
+        attributed += 1
+    # The corrupt chunks are no longer systematically dropped.
+    assert sum(1 for c in chunks if "�" in c["content"] and "sidecar" in c) >= 1
+    assert attributed > 1
 
 
 @pytest.mark.offline
@@ -393,3 +413,84 @@ def test_split_by_character_only_emits_exact_source_spans() -> None:
         {"start": 8, "end": 12},
         {"start": 13, "end": 18},
     ]
+
+
+def _tiktoken():
+    """Real tiktoken, the tokenizer the report was produced against.
+
+    A synthetic byte-per-token tokenizer was tried first and is too
+    pathological: with a 140-byte window the decoded text is ~105 characters,
+    so the +/-32 fallback around the predicted start is exhausted by ordinary
+    drift and unrelated windows lose their span. Real BPE averages ~4 bytes
+    per token, and the anchoring was built for that.
+    """
+    from lightrag.utils import TiktokenTokenizer
+
+    return Tokenizer(model_name="tiktoken", tokenizer=TiktokenTokenizer())
+
+
+def _write_single_content_block(path: Path, content: str) -> str:
+    rows = [
+        {"type": "meta"},
+        {
+            "type": "content",
+            "blockid": "4112" * 8,
+            "format": "plain_text",
+            "content": content,
+            "heading": "",
+            "parent_headings": [],
+            "level": 1,
+        },
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return str(path)
+
+
+@pytest.mark.offline
+def test_multibyte_document_keeps_provenance_for_every_chunk(tmp_path):
+    """No chunk may be dropped from provenance because of a split character.
+
+    A chunk whose decoded content carries U+FFFD used to be skipped outright
+    by ``backfill_chunk_sidecars()``. On emoji-heavy input at default-ish
+    settings that was not one chunk but several *consecutive* ones, so a
+    contiguous stretch of the document was covered by no chunk's span at all.
+    """
+    content = (
+        "Release notes: 🎉 chunker ✅ shipped. "
+        "Families 👨👩👧👦 and flags 🇨🇳 🇯🇵 appear in user text. "
+    ) * 24
+    tok = _tiktoken()
+
+    chunks = chunking_by_token_size(
+        tok,
+        content,
+        chunk_token_size=140,
+        chunk_overlap_token_size=20,
+        _emit_source_span=True,
+    )
+    assert len(chunks) > 2
+    # The premise: some chunk really does carry a split character.
+    assert any(chr(0xFFFD) in c["content"] for c in chunks), (
+        "fixture no longer exercises a split multi-byte character"
+    )
+
+    blocks_path = _write_single_content_block(tmp_path / "blocks.jsonl", content)
+    backfill_chunk_sidecars(chunks, blocks_path)
+
+    dropped = [c["chunk_order_index"] for c in chunks if not c.get("sidecar")]
+    assert not dropped, f"chunks dropped from provenance: {dropped}"
+
+    assert len(chunks) > 1
+
+    # Must not raise: that is the whole point of the guard.
+    backfill_chunk_sidecars(chunks, blocks_path)
+
+    uncredited = [
+        ch["chunk_order_index"]
+        for ch in chunks
+        if ch["content"].strip() and "sidecar" not in ch
+    ]
+    assert not uncredited, (
+        f"chunks left without provenance: {uncredited} -- the document degraded "
+        f"instead of failing, but coverage regressed"
+    )

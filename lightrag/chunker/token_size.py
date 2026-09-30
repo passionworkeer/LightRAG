@@ -47,6 +47,43 @@ def _source_span(content: str, start: int, end: int) -> dict[str, int] | None:
     return {"start": start, "end": end}
 
 
+_REPLACEMENT_CHAR = "�"
+
+
+def _replacement_edge_match(source_text: str, body: str) -> bool:
+    """True when two texts differ only by replacement characters at the edges.
+
+    A token window whose boundary split a multi-byte character decodes that
+    character as U+FFFD, so the chunk's content and its source span differ at
+    the edges only. Each side accounts for exactly one source character --
+    a window boundary cannot split more than that -- but the *number* of
+    U+FFFD is meaningless: a 4-byte character with 1, 2 or 3 of its bytes
+    inside the window decodes to 1, 2 or 3 of them. So the two sides are
+    aligned by "one character per side that has a replacement", not by
+    counting them.
+
+    An interior U+FFFD is never accepted: the replacement character only
+    appears where a window begins or ends, so one in the middle means the
+    chunk really did lose bytes.
+
+    Shared with ``lightrag.sidecar.backfill`` so the chunker and the
+    validator cannot drift apart -- they are two halves of one rule.
+    """
+    if _REPLACEMENT_CHAR not in body:
+        return False
+    core = body.strip(_REPLACEMENT_CHAR)
+    if not core:
+        return False
+    head = 1 if body.startswith(_REPLACEMENT_CHAR) else 0
+    tail = 1 if body.endswith(_REPLACEMENT_CHAR) else 0
+    if len(source_text) != len(core) + head + tail:
+        return False
+    return (
+        source_text[head : len(source_text) - tail if tail else len(source_text)]
+        == core
+    )
+
+
 def _token_window_source_span(
     tokenizer: Tokenizer,
     content: str,
@@ -69,27 +106,58 @@ def _token_window_source_span(
     position each call keeps the error from accumulating. Net cost is O(N) total
     while the located span stays byte-exact.
 
-    Returns ``(span, new_anchor)``. On an unlocatable (U+FFFD) window the span is
-    ``None`` and the anchor is returned unchanged so the next window still predicts
-    from the last verified position.
+    Returns ``(span, new_anchor)``. A window whose boundary split a multi-byte
+    character still resolves, because the replacement characters are trimmed
+    before the probe and the span is widened back over them; a window that is
+    nothing *but* replacement characters stays unlocatable and the anchor is
+    returned unchanged so the next window still predicts from the last
+    verified position.
     """
     anchor_token, anchor_char = anchor
     window = tokenizer.decode(tokens[start_token:end_token])
+    # A multi-byte char split at either window boundary decodes to U+FFFD, so
+    # the decoded window differs from the source slice only at its edges. How
+    # *many* U+FFFD one split character produces depends on how many of its
+    # bytes landed inside the window (a 4-byte char can leave 1, 2 or 3), so the
+    # replacement characters cannot be counted to size the widening -- only
+    # their presence matters, because a window boundary splits at most one
+    # character per side. Probe with them trimmed and widen by one character
+    # per side that had one.
+    core = window.strip(_REPLACEMENT_CHAR)
+    lead = 1 if window.startswith(_REPLACEMENT_CHAR) else 0
+    trail = 1 if window.endswith(_REPLACEMENT_CHAR) else 0
     if start_token >= anchor_token:
         start = anchor_char + len(tokenizer.decode(tokens[anchor_token:start_token]))
     else:  # non-monotonic caller (not expected) — fall back to a full prefix decode
         start = len(tokenizer.decode(tokens[:start_token]))
     end = start + len(window)
     if content[start:end] != window:
-        found = content.find(
-            window,
-            max(0, start - 32),
-            min(len(content), end + 32 + len(window)),
-        )
-        if found < 0:
+        if not core:
             return None, anchor
-        start = found
-        end = found + len(window)
+        lo = max(0, start - 32)
+        hi = min(len(content), end + 32 + len(core))
+        # find() returns only the first hit, and a window carrying replacement
+        # characters searches for a shorter needle -- a repeated phrase or a
+        # common token run is therefore more likely to produce a near-miss here
+        # than for a clean window. Keep looking instead of giving up on the
+        # first candidate that does not line up.
+        search_from = lo
+        while True:
+            found = content.find(core, search_from, hi)
+            if found < 0:
+                return None, anchor
+            start = found - lead
+            end = found + len(core) + trail
+            if (
+                start >= 0
+                and end <= len(content)
+                and (
+                    core == window
+                    or _replacement_edge_match(content[start:end], window)
+                )
+            ):
+                break
+            search_from = found + 1
     return _source_span(content, start, end), (start_token, start)
 
 

@@ -19,7 +19,12 @@ from __future__ import annotations
 import pytest
 
 from lightrag.chunker import chunking_by_fixed_token
-from lightrag.chunker.token_size import _source_span, _token_window_source_span
+from lightrag.chunker.token_size import (
+    _replacement_edge_match,
+    _source_span,
+    _token_window_source_span,
+    chunking_by_token_size,
+)
 from lightrag.utils import Tokenizer, TokenizerInterface
 
 
@@ -199,3 +204,139 @@ def test_decode_budget_is_linear_not_quadratic() -> None:
 
     # Empirically ~3.2*N for the delta path; the old prefix decode is ~24*N here.
     assert counting.decoded_tokens <= 6 * n
+
+
+def _tiktoken():
+    """Real tiktoken, the tokenizer the report was produced against.
+
+    A synthetic byte-per-token tokenizer was tried first and is too
+    pathological: with a 140-byte window the decoded text is ~105 characters,
+    so the +/-32 fallback around the predicted start is exhausted by ordinary
+    drift and unrelated windows lose their span. Real BPE averages ~4 bytes
+    per token, and the anchoring was built for that.
+    """
+    from lightrag.utils import TiktokenTokenizer
+
+    return Tokenizer(model_name="tiktoken", tokenizer=TiktokenTokenizer())
+
+
+def _multibyte_document() -> str:
+    para = (
+        "Release notes: 🎉 chunker ✅ shipped. "
+        "Families 👨👩👧👦 and flags 🇨🇳 🇯🇵 appear in user text. "
+    )
+    return para * 24
+
+
+@pytest.mark.offline
+def test_window_splitting_a_character_keeps_its_span():
+    """A window whose boundary cuts a multi-byte character still resolves.
+
+    The decoded window differs from the source slice only by the U+FFFD that
+    replaced the split character, so trimming those before the probe and
+    widening the span back over them recovers the exact position.
+    """
+    content = _multibyte_document()
+    tok = _tiktoken()
+
+    chunks = chunking_by_token_size(
+        tok,
+        content,
+        chunk_token_size=140,
+        chunk_overlap_token_size=20,
+        _emit_source_span=True,
+    )
+
+    assert len(chunks) > 1
+    for chunk in chunks:
+        span = chunk.get("_source_span")
+        assert span is not None, (
+            f"chunk {chunk['chunk_order_index']} lost its span; "
+            f"content carries {chunk['content'].count(chr(0xFFFD))} replacement char(s)"
+        )
+        # The span covers the real characters; the chunk's own text carries
+        # U+FFFD where a boundary split one, so byte equality is the wrong
+        # assertion -- the replacement-edge rule is.
+        assert (
+            _replacement_edge_match(
+                content[span["start"] : span["end"]], chunk["content"]
+            )
+            or content[span["start"] : span["end"]] == chunk["content"].strip()
+        )
+
+
+@pytest.mark.offline
+def test_no_gap_is_left_between_consecutive_spans_on_multibyte_text():
+    """The regression that matters: consecutive windows must not leave a hole.
+
+    Losing a span does not only cost that one chunk -- the surviving spans do
+    not reach across the gap, so a run of consecutive windows left a
+    contiguous stretch of the document covered by no chunk at all.
+    """
+    content = _multibyte_document()
+    tok = _tiktoken()
+
+    chunks = chunking_by_token_size(
+        tok,
+        content,
+        chunk_token_size=140,
+        chunk_overlap_token_size=20,
+        _emit_source_span=True,
+    )
+
+    covered = bytearray(len(content))
+    for chunk in chunks:
+        span = chunk.get("_source_span")
+        assert span is not None, f"chunk {chunk['chunk_order_index']} lost its span"
+        for i in range(span["start"], span["end"]):
+            covered[i] = 1
+
+    gaps, run_start = [], None
+    for i, hit in enumerate(covered):
+        if not hit and run_start is None:
+            run_start = i
+        elif hit and run_start is not None:
+            gaps.append((run_start, i))
+            run_start = None
+    if run_start is not None:
+        gaps.append((run_start, len(covered)))
+
+    # Only trailing/leading whitespace may sit outside a span; spans are trimmed.
+    gaps = [(s, e) for s, e in gaps if content[s:e].strip() != ""]
+    assert not gaps, f"non-whitespace text covered by no chunk span: {gaps}"
+
+
+@pytest.mark.offline
+def test_clean_window_keeps_the_span_the_find_fallback_located():
+    """The +/-32 find fallback must keep its verdict for a clean window.
+
+    Regression guard. The replacement-edge predicate was at first applied to
+    *every* window, including ones with no U+FFFD. Such a window that missed
+    its predicted offset but was then located by the fallback was rejected
+    anyway, and because its body carries no replacement character
+    `_is_unlocatable` said the chunk was fine, so backfill raised
+    ChunkBlockMatchError and failed a document that previously degraded to a
+    missing sidecar.
+
+    Driving the helper directly keeps the test deterministic: it does not
+    depend on finding a document that happens to split a character, which is
+    why a whole-document fixture could not reproduce this.
+    """
+    content = "".join(chr(ord("a") + (i % 26)) for i in range(200))
+    tok = Tokenizer(model_name="char", tokenizer=_CharTokenizer())
+    start_token, end_token = 20, 60
+    # A deliberately wrong anchor: 5 characters too far along, which is what a
+    # drifted anchor looks like in practice.
+    span, _new_anchor = _token_window_source_span(
+        tok,
+        content,
+        tok.encode(content),
+        start_token,
+        end_token,
+        anchor=(0, 5),
+    )
+    assert span is not None, (
+        "a clean window located by the +/-32 fallback was discarded; that turns "
+        "'found it a few characters away' into 'give up' and fails the document"
+    )
+    assert content[span["start"] : span["end"]] == content[start_token:end_token]
