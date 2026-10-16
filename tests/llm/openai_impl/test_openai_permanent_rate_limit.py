@@ -248,10 +248,11 @@ def _counting_transport(
 def _client_factory(transport: httpx.MockTransport):
     """Build a fresh client per call, all sharing one counting transport.
 
-    Every tenacity attempt calls ``create_openai_async_client`` anew, and the
-    error handlers close the client they were given, so a single shared
-    instance would fail the second attempt with a connection error instead of
-    reaching the transport.
+    Every tenacity attempt calls ``create_openai_async_client`` anew, and a
+    client the bindings built is closed on the failure path, so a single
+    shared instance would fail the second attempt with a connection error
+    instead of reaching the transport. (Since #4236 a caller-supplied
+    transport is left open instead, but this factory never injects one.)
     """
     from lightrag.llm.openai import create_openai_async_client
 

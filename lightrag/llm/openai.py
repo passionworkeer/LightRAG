@@ -41,6 +41,7 @@ from lightrag.llm._error_utils import is_permanent_rate_limit_error
 
 import numpy as np
 import base64
+from contextlib import nullcontext
 from typing import Any, Union
 
 from dotenv import load_dotenv
@@ -282,6 +283,54 @@ def create_openai_async_client(
         return AsyncOpenAI(**merged_configs)
 
 
+def _transport_is_caller_owned(client_configs: dict[str, Any] | None) -> bool:
+    """Whether ``client_configs`` injects a transport this module must not close.
+
+    ``AsyncOpenAI`` accepts ``http_client``; when it is present with a non-None
+    value the SDK stores that object as-is and ``AsyncOpenAI.close()`` becomes
+    ``await <that object>.aclose()``. The transport's lifetime then belongs to
+    whoever built it -- which is the whole point of configuring a proxy, an mTLS
+    transport, instrumentation, or a shared connection pool.
+
+    The test is on the *value*, by truthiness, matching how the SDK itself
+    decides (``self._client = http_client or AsyncHttpxClientWrapper(...)``
+    in ``openai/_base_client.py``). ``AsyncOpenAI`` reads ``http_client=None``
+    as "build your own" and installs its own ``AsyncHttpxClientWrapper``, so
+    that case is ours to close and must keep being closed. Truthiness rather
+    than ``is not None`` matters for the rarer shape where an injected client
+    is falsy: the SDK has then discarded it in favour of its own, so treating
+    it as caller-owned would leave that SDK-built transport unclosed.
+    """
+    if not client_configs:
+        return False
+    return bool(client_configs.get("http_client"))
+
+
+async def _close_client(
+    client: AsyncOpenAI, caller_owns_transport: bool, context: str
+) -> None:
+    """Close ``client`` unless its transport belongs to the caller.
+
+    Every close site in these bindings routes through here so the ownership
+    rule is stated once. Closing a caller-supplied transport is not a tidy-up:
+    the tenacity decorators on ``openai_complete_if_cache`` / ``openai_embed``
+    re-enter with the same kwargs, so the next attempt builds a fresh
+    ``AsyncOpenAI`` around the now-closed transport and fails locally with
+    "Cannot send a request, as the client has been closed." One transient blip
+    then becomes a permanent failure whose reported cause is a bogus connection
+    error rather than the real one.
+
+    ``context`` only labels the log line; close failures stay non-fatal exactly
+    as they were when each site closed the client inline.
+    """
+    if caller_owns_transport:
+        return
+    try:
+        await client.close()
+    except Exception as close_error:
+        logger.warning(f"Failed to close OpenAI client ({context}): {close_error}")
+
+
 # Token-limit-truncated completions (finish_reason == "length") are returned
 # wrapped in TruncatedResponse so the cache layer skips persisting incomplete
 # output. See the "Note on truncated structured output" in the docstring below.
@@ -415,6 +464,7 @@ async def openai_complete_if_cache(
 
     # Extract client configuration options
     client_configs = kwargs.pop("openai_client_configs", {})
+    caller_owns_transport = _transport_is_caller_owned(client_configs)
 
     # Deprecation shims: map legacy boolean flags to response_format only when
     # an explicit response_format was not supplied by the caller. Prefer passing
@@ -507,27 +557,22 @@ async def openai_complete_if_cache(
         )
     except APITimeoutError as e:
         logger.error(f"OpenAI API Timeout Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_client(openai_async_client, caller_owns_transport, "timeout path")
         raise
     except APIConnectionError as e:
         logger.error(f"OpenAI API Connection Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_client(
+            openai_async_client, caller_owns_transport, "connection error path"
+        )
         raise
     except RateLimitError as e:
         if is_permanent_rate_limit_error(e):
             logger.error(f"OpenAI API Spend Limit Reached (not retrying): {e}")
         else:
             logger.error(f"OpenAI API Rate Limit Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_client(
+            openai_async_client, caller_owns_transport, "rate limit path"
+        )
         raise
     except BadRequestError as e:
         # A "could not parse JSON body" 400 is transient (corrupted/truncated
@@ -536,10 +581,9 @@ async def openai_complete_if_cache(
         # Either way we must close the client before re-raising, matching the
         # other except branches above — otherwise non-transient 400s would
         # leak httpx connections in validation-heavy/misconfigured runs.
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_client(
+            openai_async_client, caller_owns_transport, "bad request path"
+        )
         # Heuristic: match on the provider's error wording. It can drift across
         # providers/proxies or localization, and a genuinely malformed request
         # body (e.g. invalid user-supplied JSON) could also surface this text —
@@ -564,10 +608,9 @@ async def openai_complete_if_cache(
         logger.error(
             f"OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
         )
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_client(
+            openai_async_client, caller_owns_transport, "call failure path"
+        )
         raise
 
     if hasattr(response, "__aiter__"):
@@ -719,13 +762,9 @@ async def openai_complete_if_cache(
                         logger.warning(
                             f"Failed to close stream response: {close_error}"
                         )
-                # Ensure client is closed in case of exception
-                try:
-                    await openai_async_client.close()
-                except Exception as client_close_error:
-                    logger.warning(
-                        f"Failed to close OpenAI client after stream error: {client_close_error}"
-                    )
+                await _close_client(
+                    openai_async_client, caller_owns_transport, "stream error path"
+                )
                 raise
             finally:
                 # Final safety check for unclosed COT tags, skipped while
@@ -758,16 +797,11 @@ async def openai_complete_if_cache(
                                 f"Unexpected error during stream response cleanup: {close_error}"
                             )
 
-                # This prevents resource leaks since the caller doesn't handle closing
-                try:
-                    await openai_async_client.close()
-                    logger.debug(
-                        "Successfully closed OpenAI client for streaming response"
-                    )
-                except Exception as client_close_error:
-                    logger.warning(
-                        f"Failed to close OpenAI client in streaming finally block: {client_close_error}"
-                    )
+                await _close_client(
+                    openai_async_client,
+                    caller_owns_transport,
+                    "streaming finally block",
+                )
 
         return inner()
 
@@ -794,10 +828,9 @@ async def openai_complete_if_cache(
                 or not hasattr(response.choices[0], "message")
             ):
                 logger.error("Invalid response from OpenAI API")
-                try:
-                    await openai_async_client.close()
-                except Exception as close_error:
-                    logger.warning(f"Failed to close OpenAI client: {close_error}")
+                await _close_client(
+                    openai_async_client, caller_owns_transport, "invalid response path"
+                )
                 raise InvalidResponseError("Invalid response from OpenAI API")
 
             message = response.choices[0].message
@@ -885,10 +918,9 @@ async def openai_complete_if_cache(
                         f"({diagnostics}): {hint}"
                     )
                     logger.error(error_message)
-                    try:
-                        await openai_async_client.close()
-                    except Exception as close_error:
-                        logger.warning(f"Failed to close OpenAI client: {close_error}")
+                    await _close_client(
+                        openai_async_client, caller_owns_transport, "empty content path"
+                    )
                     # The hint rides along into the exception (and therefore
                     # into doc_status.error_msg) rather than living only in the
                     # server log: the operator reading the failed document is
@@ -925,13 +957,11 @@ async def openai_complete_if_cache(
 
             return final_content
         finally:
-            # Ensure client is closed in all cases for non-streaming responses
-            try:
-                await openai_async_client.close()
-            except Exception as close_error:
-                logger.warning(
-                    f"Failed to close OpenAI client in non-streaming finally block: {close_error}"
-                )
+            await _close_client(
+                openai_async_client,
+                caller_owns_transport,
+                "non-streaming finally block",
+            )
 
 
 async def openai_complete(
@@ -1173,7 +1203,12 @@ async def openai_embed(
         client_configs=client_configs,
     )
 
-    async with openai_async_client:
+    # An injected transport outlives this call, so the context manager must
+    # not close it; a client the SDK built for us still must be.
+    caller_owns_transport = _transport_is_caller_owned(client_configs)
+    client_scope = nullcontext() if caller_owns_transport else openai_async_client
+
+    async with client_scope:
         # Determine the correct model identifier to use
         # For Azure OpenAI, we must use the deployment name instead of the model name
         api_model = azure_deployment if use_azure and azure_deployment else model
