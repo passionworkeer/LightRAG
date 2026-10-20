@@ -191,6 +191,21 @@ _FEEDER_POLL_SECONDS = 0.5
 # one admission, not a whole drain.
 _FEEDER_DRAIN_LIMIT = 256
 
+# Peak concurrent multimodal cache operations -- reads and writes together --
+# for ONE document. Every sidecar item is scheduled as its own task, so
+# without a gate the live storage calls track the item count rather than any
+# budget: one document with N items becomes N concurrent reads and, since
+# ``save_to_cache`` costs two round-trips each, up to 2N concurrent writes.
+# That is how a Redis backend reaches ``REDIS_MAX_CONNECTIONS``.
+#
+# Deliberately NOT tied to ``max_parallel_analyze``: that field builds the
+# per-document ``_analyze_worker`` pool (one worker per document), so it is
+# a document-level budget, not an intra-document one. ``llm_model_max_async``
+# is what actually caps VLM/extract concurrency. Reusing either would
+# conflate two different limits. This is internal tuning, not a
+# ``LightRAG`` config field.
+_MULTIMODAL_CACHE_OP_CONCURRENCY = 5
+
 # Manual DRAIN_TO_IDLE poll: how long to sleep between re-checks while waiting
 # for pre-freeze in-flight enqueue reservations (pending_enqueues > 0) to
 # finish (LR2 §7.2 step 5). Bounded by the background enqueue's own duration —
@@ -6869,6 +6884,21 @@ class _PipelineMixin:
         """
         from lightrag.parser.routing import parse_process_options
 
+        # One gate per document, shared by every item task below, so the
+        # in-flight cache reads stay capped however many items the sidecars
+        # hold. Item tasks are still all scheduled: the gate shapes how many
+        # reach the storage backend at once, not how many are created, so the
+        # fail-fast poll and the sidecar write keep their current behaviour.
+        cache_op_gate = asyncio.Semaphore(_MULTIMODAL_CACHE_OP_CONCURRENCY)
+
+        async def _read_cache_bounded(*args: Any, **kwargs: Any) -> Any:
+            async with cache_op_gate:
+                return await handle_cache(*args, **kwargs)
+
+        async def _write_cache_bounded(*args: Any, **kwargs: Any) -> Any:
+            async with cache_op_gate:
+                return await save_to_cache(*args, **kwargs)
+
         blocks_path = parsed_data.get("blocks_path")
         if not blocks_path:
             parsed_data["analyzing_stage_skipped"] = True
@@ -7332,7 +7362,7 @@ class _PipelineMixin:
                     "drawing",
                 )
                 cache_id = generate_cache_key("default", "analysis", args_hash)
-                cached = await handle_cache(
+                cached = await _read_cache_bounded(
                     self.llm_response_cache,
                     args_hash,
                     prompt,
@@ -7380,7 +7410,7 @@ class _PipelineMixin:
                         if audit_blob
                         else ""
                     )
-                    await save_to_cache(
+                    await _write_cache_bounded(
                         self.llm_response_cache,
                         CacheData(
                             args_hash=args_hash,
@@ -7610,7 +7640,7 @@ class _PipelineMixin:
                     kind,
                 )
                 cache_id = generate_cache_key("default", "analysis", args_hash)
-                cached = await handle_cache(
+                cached = await _read_cache_bounded(
                     self.llm_response_cache,
                     args_hash,
                     prompt,
@@ -7660,7 +7690,7 @@ class _PipelineMixin:
                     fresh, result_text, f"{kind}/{item_id}"
                 )
                 if fresh and analysis_cache_enabled and not response_truncated:
-                    await save_to_cache(
+                    await _write_cache_bounded(
                         self.llm_response_cache,
                         CacheData(
                             args_hash=args_hash,
